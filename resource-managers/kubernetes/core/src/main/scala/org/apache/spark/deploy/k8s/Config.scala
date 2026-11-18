@@ -665,6 +665,28 @@ private[spark] object Config extends Logging {
       .checkValue(value => value > 0, "Allocation executor timeout must be a positive time value.")
       .createWithDefaultString("600s")
 
+  val KUBERNETES_EXECUTOR_REGISTRATION_TIMEOUT_ENABLED =
+    ConfigBuilder("spark.kubernetes.executor.registrationTimeout.enabled")
+      .internal()
+      .doc("Whether the direct allocator should retire and replace scheduled executor pods " +
+        "that do not register within spark.kubernetes.executor.registrationTimeout. " +
+        "When disabled, keep the previous allocation and failure-counting behavior.")
+      .version("4.5.0")
+      .booleanConf
+      .createWithDefault(true)
+
+  val KUBERNETES_EXECUTOR_REGISTRATION_TIMEOUT =
+    ConfigBuilder("spark.kubernetes.executor.registrationTimeout")
+      .doc("Time for an executor to register after its pod is scheduled onto a node. " +
+        "With the direct allocator, scheduled pods that exceed this timeout are retired and " +
+        "replaced. Timeouts count toward spark.executor.maxNumFailures and follow " +
+        "spark.executor.failuresValidityInterval. Unscheduled pods are not timed out. " +
+        "Only applies when spark.kubernetes.executor.registrationTimeout.enabled is true.")
+      .version("4.5.0")
+      .timeConf(TimeUnit.MILLISECONDS)
+      .checkValue(_ > 0, "Executor registration timeout must be positive.")
+      .createWithDefaultString("600s")
+
   val WAIT_FOR_APP_COMPLETION =
     ConfigBuilder("spark.kubernetes.submission.waitAppCompletion")
       .doc("In cluster mode, whether to wait for the application to finish before exiting the " +

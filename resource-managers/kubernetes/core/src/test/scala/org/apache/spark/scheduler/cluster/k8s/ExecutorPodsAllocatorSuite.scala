@@ -42,7 +42,7 @@ import org.apache.spark.deploy.k8s.Fabric8Aliases._
 import org.apache.spark.internal.config._
 import org.apache.spark.resource._
 import org.apache.spark.scheduler.cluster.k8s.ExecutorLifecycleTestUtils._
-import org.apache.spark.util.ManualClock
+import org.apache.spark.util.{ManualClock, SparkExitCode}
 
 class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
 
@@ -66,6 +66,7 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
   private val podAllocationSize = conf.get(KUBERNETES_ALLOCATION_BATCH_SIZE)
   private val podAllocationDelay = conf.get(KUBERNETES_ALLOCATION_BATCH_DELAY)
   private val executorIdleTimeout = conf.get(DYN_ALLOCATION_EXECUTOR_IDLE_TIMEOUT) * 1000
+  private val registrationTimeout = conf.get(KUBERNETES_EXECUTOR_REGISTRATION_TIMEOUT)
   private val podCreationTimeout = math.max(podAllocationDelay * 5,
     conf.get(KUBERNETES_ALLOCATION_EXECUTOR_TIMEOUT))
 
@@ -127,6 +128,7 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     MockitoAnnotations.openMocks(this).close()
     when(kubernetesClient.pods()).thenReturn(podOperations)
     when(podOperations.inNamespace("default")).thenReturn(podsWithNamespace)
+    when(podsWithNamespace.withName(anyString())).thenReturn(podResource)
     when(podsWithNamespace.withName(driverPodName)).thenReturn(driverPodOperations)
     when(podsWithNamespace.resource(any())).thenReturn(podResource)
     when(podsWithNamespace.withLabel(anyString(), anyString())).thenReturn(labeledPods)
@@ -147,6 +149,7 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
       conf, secMgr, executorBuilder, kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
     podsAllocatorUnderTest.setExecutorPodsLifecycleManager(lifecycleManager)
     when(schedulerBackend.getExecutorIds()).thenReturn(Seq.empty)
+    when(schedulerBackend.excludeExecutorIfUnregistered(anyString())).thenReturn(true)
     podsAllocatorUnderTest.start(TEST_SPARK_APP_ID, schedulerBackend)
     when(kubernetesClient.persistentVolumeClaims()).thenReturn(persistentVolumeClaims)
     when(persistentVolumeClaims.inNamespace("default")).thenReturn(pvcWithNamespace)
@@ -455,6 +458,391 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     assert(podsAllocatorUnderTest.invokePrivate(numOutstandingPods).get() == 1)
     verify(labeledPods).delete()
     verify(podsWithNamespace).resource(podWithAttachedContainerForId(2))
+  }
+
+  for {
+    reason <- Seq("ImageInspectError", "ErrImagePull", "ImagePullBackOff")
+    phase <- Seq("Pending", "Running")
+  } {
+    test(s"SPARK-61890: replace an unregistered $phase executor stuck in $reason") {
+      val startTime = Instant.parse("2026-01-01T00:00:00Z").toEpochMilli
+      waitForExecutorPodsClock.setTime(startTime)
+      podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+      verify(podResource).create()
+
+      val stuckPod = executorWithImageStartupError(reason, phase, startTime)
+      snapshotsStore.updatePod(stuckPod)
+      snapshotsStore.notifySubscribers()
+      verify(podResource, times(1)).create()
+      verify(labeledPods, never()).delete()
+
+      // The pod exists, but its executor process has never registered with the driver.
+      waitForExecutorPodsClock.advance(registrationTimeout + 1)
+      snapshotsStore.updatePod(stuckPod)
+      snapshotsStore.notifySubscribers()
+
+      assert(podsAllocatorUnderTest.isDeleted("1"),
+        s"Executor 1 stayed in $reason without registering beyond the timeout")
+      verify(podResource).delete()
+      verify(lifecycleManager).registerExecutorFailure(1L)
+      snapshotsStore.replaceSnapshot(Seq.empty)
+      snapshotsStore.notifySubscribers()
+      verify(podsWithNamespace).resource(podWithAttachedContainerForId(2))
+      verify(podResource, times(2)).create()
+    }
+  }
+
+  test("SPARK-61890: retain an unscheduled executor beyond the registration timeout") {
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    val pendingPod = pendingExecutor(1)
+    snapshotsStore.updatePod(pendingPod)
+    snapshotsStore.notifySubscribers()
+
+    waitForExecutorPodsClock.advance(registrationTimeout + 1)
+    snapshotsStore.updatePod(pendingPod)
+    snapshotsStore.notifySubscribers()
+
+    assert(!podsAllocatorUnderTest.isDeleted("1"))
+    verify(labeledPods, never()).delete()
+    verify(podResource, times(1)).create()
+  }
+
+  test("SPARK-61890: retain an executor that recovers from an image startup error") {
+    val startTime = Instant.parse("2026-01-01T00:00:00Z").toEpochMilli
+    waitForExecutorPodsClock.setTime(startTime)
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    snapshotsStore.updatePod(
+      executorWithImageStartupError("ImagePullBackOff", "Pending", startTime))
+    snapshotsStore.notifySubscribers()
+
+    waitForExecutorPodsClock.advance(registrationTimeout / 2)
+    when(schedulerBackend.getExecutorIds()).thenReturn(Seq("1"))
+    snapshotsStore.updatePod(runningExecutor(1))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(registrationTimeout + 1)
+    snapshotsStore.updatePod(runningExecutor(1))
+    snapshotsStore.notifySubscribers()
+
+    assert(!podsAllocatorUnderTest.isDeleted("1"))
+    verify(labeledPods, never()).delete()
+    verify(podResource, times(1)).create()
+    assert(podsAllocatorUnderTest.invokePrivate(numOutstandingPods).get() == 0)
+  }
+
+  test("SPARK-61890: start the registration deadline only when the pod is scheduled") {
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    val unscheduled = new PodBuilder(pendingExecutor(1))
+      .editStatus()
+        .addNewCondition()
+          .withType("PodScheduled")
+          .withStatus("False")
+          .withReason("Unschedulable")
+          .endCondition()
+        .endStatus()
+      .build()
+    snapshotsStore.updatePod(unscheduled)
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(registrationTimeout * 10)
+    snapshotsStore.notifySubscribers()
+    verify(podResource, never()).delete()
+
+    snapshotsStore.updatePod(executorWithImageStartupError(
+      "ImageInspectError", "Pending", waitForExecutorPodsClock.getTimeMillis()))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(registrationTimeout - 1)
+    snapshotsStore.notifySubscribers()
+    verify(podResource, never()).delete()
+    waitForExecutorPodsClock.advance(1)
+    snapshotsStore.notifySubscribers()
+    verify(podResource).delete()
+    verify(podResource, times(2)).create()
+  }
+
+  test("SPARK-61890: expire without new pod events and count repeated snapshots only once") {
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    val pod = executorWithImageStartupError("ImageInspectError", "Pending", 0)
+    snapshotsStore.updatePod(pod)
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(registrationTimeout)
+    snapshotsStore.notifySubscribers()
+    verify(podResource).delete()
+    snapshotsStore.updatePod(pod)
+    snapshotsStore.notifySubscribers()
+    verify(lifecycleManager, times(1)).registerExecutorFailure(1L)
+    verify(podResource, times(2)).create()
+  }
+
+  test("SPARK-61890: do not expire an executor that registers at the deadline") {
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    snapshotsStore.updatePod(executorWithImageStartupError("ImageInspectError", "Pending", 0))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(registrationTimeout)
+    // Registration wins the race on the driver endpoint after the allocator reads executor IDs.
+    when(schedulerBackend.excludeExecutorIfUnregistered("1")).thenReturn(false)
+    snapshotsStore.notifySubscribers()
+    assert(!podsAllocatorUnderTest.isDeleted("1"))
+    verify(lifecycleManager, never()).registerExecutorFailure(1L)
+    verify(podResource, never()).delete()
+    verify(podResource, times(1)).create()
+  }
+
+  test("SPARK-61890: retry cleanup without recounting a registration failure") {
+    when(podResource.delete())
+      .thenThrow(new KubernetesClientException("temporary delete failure"))
+      .thenReturn(java.util.Collections.emptyList())
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    snapshotsStore.updatePod(executorWithImageStartupError("ImageInspectError", "Pending", 0))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(registrationTimeout)
+    snapshotsStore.notifySubscribers()
+    snapshotsStore.notifySubscribers()
+    verify(podResource, times(2)).delete()
+    verify(lifecycleManager, times(1)).registerExecutorFailure(1L)
+    verify(podResource, times(2)).create()
+  }
+
+  test("SPARK-61890: retain timed out pods as inactive when deletion is disabled") {
+    val keepPodsConf = conf.clone.set(KUBERNETES_DELETE_EXECUTORS, false)
+    resetRegistrationAllocator(keepPodsConf)
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    snapshotsStore.updatePod(executorWithImageStartupError("ImageInspectError", "Pending", 0))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(registrationTimeout)
+    snapshotsStore.notifySubscribers()
+    verify(podResource, never()).delete()
+    val podCaptor = ArgumentCaptor.forClass(classOf[Pod])
+    verify(podResource).patch(any(classOf[io.fabric8.kubernetes.client.dsl.base.PatchContext]),
+      podCaptor.capture())
+    assert(podCaptor.getValue.getMetadata.getLabels.get(SPARK_EXECUTOR_INACTIVE_LABEL) == "true")
+    verify(podResource, times(2)).create()
+  }
+
+  test("SPARK-61890: registration timeout recovery is enabled by default") {
+    assert(conf.get(KUBERNETES_EXECUTOR_REGISTRATION_TIMEOUT_ENABLED))
+  }
+
+  for {
+    reason <- Seq("ImageInspectError", "ErrImagePull", "ImagePullBackOff")
+    phase <- Seq("Pending", "Running")
+  } {
+    test(s"SPARK-61890: disabled recovery retains a $phase executor stuck in $reason") {
+      resetRegistrationAllocator(conf.clone
+        .set(KUBERNETES_EXECUTOR_REGISTRATION_TIMEOUT_ENABLED, false)
+        .set(MAX_EXECUTOR_FAILURES, 1))
+      podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+      val pod = executorWithImageStartupError(reason, phase, 0)
+      snapshotsStore.updatePod(pod)
+      snapshotsStore.notifySubscribers()
+      waitForExecutorPodsClock.advance(registrationTimeout * 10)
+      snapshotsStore.updatePod(pod)
+      snapshotsStore.notifySubscribers()
+      snapshotsStore.notifySubscribers()
+
+      assert(!podsAllocatorUnderTest.isDeleted("1"))
+      verify(podResource, never()).delete()
+      verify(podResource, never()).patch(
+        any(classOf[io.fabric8.kubernetes.client.dsl.base.PatchContext]), any(classOf[Pod]))
+      verify(schedulerBackend, never()).excludeExecutorIfUnregistered(anyString())
+      verify(lifecycleManager, never()).registerExecutorFailure(1L)
+      verify(lifecycleManager, never()).stopApplication(SparkExitCode.EXCEED_MAX_EXECUTOR_FAILURES)
+      verify(podResource, times(1)).create()
+    }
+  }
+
+  test("SPARK-61890: disabled recovery preserves the pod creation timeout") {
+    resetRegistrationAllocator(conf.clone
+      .set(KUBERNETES_EXECUTOR_REGISTRATION_TIMEOUT_ENABLED, false))
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    waitForExecutorPodsClock.advance(podCreationTimeout + 1)
+    snapshotsStore.notifySubscribers()
+
+    verify(labeledPods).delete()
+    verify(podsWithNamespace).resource(podWithAttachedContainerForId(2))
+    verify(podResource, times(2)).create()
+    verify(schedulerBackend, never()).excludeExecutorIfUnregistered(anyString())
+    verify(lifecycleManager, never()).registerExecutorFailure(1L)
+  }
+
+  test("SPARK-61890: disabled recovery does not evaluate registration settings") {
+    resetRegistrationAllocator(conf.clone
+      .set(KUBERNETES_EXECUTOR_REGISTRATION_TIMEOUT_ENABLED, false)
+      .set(KUBERNETES_EXECUTOR_REGISTRATION_TIMEOUT.key, "not-a-duration"))
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    snapshotsStore.updatePod(executorWithImageStartupError("ImageInspectError", "Pending", 0))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(registrationTimeout * 10)
+    snapshotsStore.notifySubscribers()
+
+    verify(podResource, never()).delete()
+    verify(podResource, times(1)).create()
+  }
+
+  test("SPARK-61890: enabled recovery still validates registration settings") {
+    intercept[IllegalArgumentException] {
+      resetRegistrationAllocator(conf.clone
+        .set(KUBERNETES_EXECUTOR_REGISTRATION_TIMEOUT.key, "not-a-duration"))
+    }
+  }
+
+  for (timeout <- Seq(0L, -1L)) {
+    test(s"SPARK-61890: reject a nonpositive registration timeout of $timeout") {
+      val error = intercept[IllegalArgumentException] {
+        resetRegistrationAllocator(conf.clone
+          .set(KUBERNETES_EXECUTOR_REGISTRATION_TIMEOUT, timeout))
+      }
+      assert(error.getMessage.contains("Executor registration timeout must be positive."))
+    }
+  }
+
+  for (expireFailures <- Seq(false, true)) {
+    test(s"SPARK-61890: use the executor failure limit with expiration=$expireFailures") {
+      val failureConf = conf.clone.set(MAX_EXECUTOR_FAILURES, 1)
+      if (expireFailures) {
+        failureConf.set(EXECUTOR_ATTEMPT_FAILURE_VALIDITY_INTERVAL_MS, 1L)
+      }
+      resetRegistrationAllocator(failureConf)
+      var exitCode = -1
+      val manager = new ExecutorPodsLifecycleManager(
+        failureConf, kubernetesClient, snapshotsStore, waitForExecutorPodsClock) {
+        override private[k8s] def stopApplication(code: Int): Unit = {
+          exitCode = code
+        }
+      }
+      when(schedulerBackend.getExecutorsWithRegistrationTs()).thenReturn(Map.empty[String, Long])
+      podsAllocatorUnderTest.setExecutorPodsLifecycleManager(manager)
+      manager.start(schedulerBackend)
+      podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+      for (executorId <- 1L to 2L) {
+        snapshotsStore.replaceSnapshot(Seq(executorWithImageStartupError(
+          "ImageInspectError", "Pending", waitForExecutorPodsClock.getTimeMillis(), executorId)))
+        snapshotsStore.notifySubscribers()
+        waitForExecutorPodsClock.advance(registrationTimeout)
+        snapshotsStore.notifySubscribers()
+        assert(podsAllocatorUnderTest.isDeleted(executorId.toString))
+        assert(manager.getNumExecutorsFailed == (if (expireFailures) 1 else executorId.toInt))
+        val shouldStop = !expireFailures && executorId == 2L
+        assert(exitCode == (if (shouldStop) SparkExitCode.EXCEED_MAX_EXECUTOR_FAILURES else -1))
+      }
+      if (expireFailures) {
+        verify(podResource, times(3)).create()
+      }
+    }
+  }
+
+  test("SPARK-61890: time out a scheduled pod waiting for an init container") {
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    val pod = new PodBuilder(executorWithImageStartupError("ImageInspectError", "Pending", 0))
+      .editStatus()
+        .withContainerStatuses()
+        .addNewInitContainerStatus()
+          .withName("credentials")
+          .withImage("credentials:test")
+          .withNewState()
+            .withNewWaiting()
+              .withReason("ImageInspectError")
+              .withMessage("Corrupt image layer")
+              .endWaiting()
+            .endState()
+          .endInitContainerStatus()
+        .endStatus()
+      .build()
+    snapshotsStore.updatePod(pod)
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(registrationTimeout)
+    val appender = new LogAppender("registration timeout")
+    withLogAppender(appender) {
+      snapshotsStore.notifySubscribers()
+    }
+    val messages = appender.loggingEvents.map(_.getMessage.getFormattedMessage).mkString("\n")
+    assert(messages.contains("credentials"))
+    assert(messages.contains("credentials:test"))
+    assert(messages.contains("ImageInspectError: Corrupt image layer"))
+    assert(messages.contains("node-with-broken-image"))
+    verify(podResource).delete()
+    verify(podResource, times(2)).create()
+  }
+
+  test("SPARK-61890: allow the full deadline when the scheduling timestamp is missing") {
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    waitForExecutorPodsClock.advance(registrationTimeout * 2)
+    val pod = executorWithImageStartupError("ImageInspectError", "Pending", 0)
+    pod.getStatus.getConditions.get(0).setLastTransitionTime(null)
+    snapshotsStore.updatePod(pod)
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(registrationTimeout - 1)
+    snapshotsStore.notifySubscribers()
+    verify(podResource, never()).delete()
+    waitForExecutorPodsClock.advance(1)
+    snapshotsStore.notifySubscribers()
+    verify(podResource).delete()
+  }
+
+  test("SPARK-61890: stop tracking a pod removed before registration") {
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    snapshotsStore.updatePod(executorWithImageStartupError("ImageInspectError", "Pending", 0))
+    snapshotsStore.notifySubscribers()
+    snapshotsStore.replaceSnapshot(Seq.empty)
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(registrationTimeout)
+    snapshotsStore.notifySubscribers()
+    verify(lifecycleManager, never()).registerExecutorFailure(1L)
+    verify(schedulerBackend, never()).excludeExecutorIfUnregistered(anyString())
+  }
+
+  test("SPARK-61890: do not count registration failures after the target becomes zero") {
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    snapshotsStore.updatePod(executorWithImageStartupError("ImageInspectError", "Pending", 0))
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(registrationTimeout)
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 0))
+    snapshotsStore.notifySubscribers()
+    verify(lifecycleManager, never()).registerExecutorFailure(1L)
+    verify(schedulerBackend, never()).excludeExecutorIfUnregistered(anyString())
+    verify(podResource, times(1)).create()
+  }
+
+  test("SPARK-61890: share the executor failure limit across resource profiles") {
+    val failureConf = conf.clone.set(MAX_EXECUTOR_FAILURES, 2)
+    resetRegistrationAllocator(failureConf)
+    var exitCode = -1
+    val manager = new ExecutorPodsLifecycleManager(
+      failureConf, kubernetesClient, snapshotsStore, waitForExecutorPodsClock) {
+      override private[k8s] def stopApplication(code: Int): Unit = {
+        exitCode = code
+      }
+    }
+    when(schedulerBackend.getExecutorsWithRegistrationTs()).thenReturn(Map.empty[String, Long])
+    podsAllocatorUnderTest.setExecutorPodsLifecycleManager(manager)
+    manager.start(schedulerBackend)
+    // A previous executor failure and registration timeouts share the same failure tracker.
+    manager.registerExecutorFailure(99L)
+    val rp = new ResourceProfileBuilder()
+      .require(new ExecutorResourceRequests().cores(4).memory("2g"))
+      .require(new TaskResourceRequests().cpus(2))
+      .build()
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1, rp -> 1))
+    val otherPod = executorWithImageStartupError("ImageInspectError", "Pending", 0, executorId = 2)
+    otherPod.getMetadata.getLabels.put(SPARK_RESOURCE_PROFILE_ID_LABEL, rp.id.toString)
+    snapshotsStore.updatePod(executorWithImageStartupError("ImageInspectError", "Pending", 0))
+    snapshotsStore.updatePod(otherPod)
+    snapshotsStore.notifySubscribers()
+    waitForExecutorPodsClock.advance(registrationTimeout)
+    snapshotsStore.notifySubscribers()
+    assert(manager.getNumExecutorsFailed == 3)
+    assert(exitCode == SparkExitCode.EXCEED_MAX_EXECUTOR_FAILURES)
+  }
+
+  test("SPARK-61890: do not expire a formerly registered pod during delayed removal") {
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    val pod = executorWithImageStartupError("ImageInspectError", "Running", 0)
+    snapshotsStore.updatePod(pod)
+    when(schedulerBackend.getExecutorIds()).thenReturn(Seq("1"))
+    snapshotsStore.notifySubscribers()
+    when(schedulerBackend.getExecutorIds()).thenReturn(Seq.empty)
+    waitForExecutorPodsClock.advance(registrationTimeout)
+    snapshotsStore.notifySubscribers()
+    verify(schedulerBackend, never()).excludeExecutorIfUnregistered(anyString())
+    verify(lifecycleManager, never()).registerExecutorFailure(1L)
   }
 
   test("SPARK-28487: scale up and down on target executor count changes") {
@@ -1115,6 +1503,75 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     val modifiedVolume = podVolumes.asScala
       .find(v => v.getPersistentVolumeClaim.getClaimName.equals(existingPVCName))
     assert(modifiedVolume.nonEmpty)
+  }
+
+  private def resetRegistrationAllocator(newConf: SparkConf): Unit = {
+    snapshotsStore = new DeterministicExecutorPodsSnapshotsStore()
+    podsAllocatorUnderTest = new ExecutorPodsAllocator(newConf, secMgr,
+      executorBuilder, kubernetesClient, snapshotsStore, waitForExecutorPodsClock)
+    podsAllocatorUnderTest.setExecutorPodsLifecycleManager(lifecycleManager)
+    podsAllocatorUnderTest.start(TEST_SPARK_APP_ID, schedulerBackend)
+  }
+
+  private def executorWithImageStartupError(
+      reason: String,
+      phase: String,
+      creationTime: Long,
+      executorId: Long = 1): Pod = {
+    val waitingContainer = new ContainerStatusBuilder()
+      .withName(DEFAULT_EXECUTOR_CONTAINER_NAME)
+      .withImage("spark-test:unavailable")
+      .withReady(false)
+      .withRestartCount(0)
+      .withNewState()
+        .withNewWaiting()
+          .withReason(reason)
+          .withMessage(s"Cannot start executor image: $reason")
+          .endWaiting()
+        .endState()
+      .build()
+    val builder = new PodBuilder(pendingExecutor(executorId))
+      .editMetadata()
+        .withCreationTimestamp(Instant.ofEpochMilli(creationTime).toString)
+        .endMetadata()
+      .editSpec()
+        .withNodeName("node-with-broken-image")
+        .withContainers(new ContainerBuilder()
+          .withName(DEFAULT_EXECUTOR_CONTAINER_NAME)
+          .withImage("spark-test:unavailable")
+          .build())
+        .endSpec()
+      .editStatus()
+        .withPhase(phase)
+        .addNewCondition()
+          .withType("PodScheduled")
+          .withStatus("True")
+          .withLastTransitionTime(Instant.ofEpochMilli(creationTime).toString)
+          .endCondition()
+        .withContainerStatuses(waitingContainer)
+        .endStatus()
+    if (phase == "Running") {
+      builder.editSpec()
+        .addNewContainer()
+          .withName("sidecar")
+          .withImage("sidecar:test")
+          .endContainer()
+        .endSpec()
+        .editStatus()
+          .addNewContainerStatus()
+            .withName("sidecar")
+            .withImage("sidecar:test")
+            .withReady(true)
+            .withRestartCount(0)
+            .withNewState()
+              .withNewRunning()
+                .withStartedAt(Instant.ofEpochMilli(creationTime).toString)
+                .endRunning()
+              .endState()
+            .endContainerStatus()
+          .endStatus()
+    }
+    builder.build()
   }
 
   private def executorPodAnswer(): Answer[KubernetesExecutorSpec] =

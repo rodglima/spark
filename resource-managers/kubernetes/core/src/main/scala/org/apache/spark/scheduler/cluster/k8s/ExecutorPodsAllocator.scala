@@ -22,10 +22,12 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
+import scala.util.Try
 import scala.util.control.NonFatal
 
 import io.fabric8.kubernetes.api.model.{HasMetadata, PersistentVolumeClaim, Pod, PodBuilder}
 import io.fabric8.kubernetes.client.{KubernetesClient, KubernetesClientException}
+import io.fabric8.kubernetes.client.dsl.base.{PatchContext, PatchType}
 
 import org.apache.spark.{SecurityManager, SparkConf, SparkException}
 import org.apache.spark.deploy.k8s.Config._
@@ -85,6 +87,14 @@ class ExecutorPodsAllocator(
   protected val podCreationTimeout = math.max(
     podAllocationDelay * 5,
     conf.get(KUBERNETES_ALLOCATION_EXECUTOR_TIMEOUT))
+
+  private val registrationTimeoutEnabled =
+    conf.get(KUBERNETES_EXECUTOR_REGISTRATION_TIMEOUT_ENABLED)
+  private val registrationTimeout =
+    if (registrationTimeoutEnabled) conf.get(KUBERNETES_EXECUTOR_REGISTRATION_TIMEOUT) else 0L
+  private val awaitingRegistration = mutable.Map.empty[Long, Long]
+  private val registeredExecutors = mutable.Set.empty[Long]
+  private val registrationTimedOutExecutorIds = mutable.Set.empty[Long]
 
   protected val driverPodReadinessTimeout = conf.get(KUBERNETES_ALLOCATION_DRIVER_READINESS_TIMEOUT)
 
@@ -167,6 +177,93 @@ class ExecutorPodsAllocator(
   }
 
   def isDeleted(executorId: String): Boolean = deletedExecutorIds.contains(executorId.toLong)
+
+  private def isPodInactive(pod: Pod): Boolean = {
+    pod.getMetadata.getLabels.get(SPARK_EXECUTOR_INACTIVE_LABEL) == "true"
+  }
+
+  private def registrationFailureDetails(pod: Pod): String = {
+    val status = pod.getStatus
+    val containers = Option(status.getInitContainerStatuses).toSeq.flatMap(_.asScala) ++
+      Option(status.getContainerStatuses).toSeq.flatMap(_.asScala)
+    containers.map { container =>
+      val waiting = Option(container.getState).flatMap(s => Option(s.getWaiting))
+      s"${container.getName} (image ${container.getImage}): " +
+        waiting.map(w => s"${w.getReason}: ${w.getMessage}").getOrElse("not waiting")
+    }.mkString("; ")
+  }
+
+  private def expireUnregisteredExecutors(
+      schedulerBackend: KubernetesClusterSchedulerBackend): Unit = {
+    if (!registrationTimeoutEnabled) {
+      return
+    }
+    val pods = lastSnapshot.executorPods
+    val registered = schedulerBackend.getExecutorIds().map(_.toLong).toSet
+    registeredExecutors ++= registered
+    // A registered executor can be removed from the backend before its pod disappears.
+    // That pod must not become a new registration attempt during delayed cleanup.
+    registeredExecutors.filterInPlace(id => pods.contains(id) || registered.contains(id))
+    awaitingRegistration.filterInPlace { case (id, _) =>
+      pods.contains(id) && !registeredExecutors.contains(id)
+    }
+    pods.toSeq.sortBy(_._1).foreach { case (id, state) =>
+      val pod = state.pod
+      val scheduled = Option(pod.getStatus).toSeq
+        .flatMap(s => Option(s.getConditions).toSeq.flatMap(_.asScala))
+        .find(c => c.getType == "PodScheduled" && c.getStatus == "True")
+      val rpId = pod.getMetadata.getLabels.get(SPARK_RESOURCE_PROFILE_ID_LABEL).toInt
+      val wanted = Option(totalExpectedExecutorsPerResourceProfileId.get(rpId)).exists(_ > 0)
+      val eligible = wanted &&
+        (state.isInstanceOf[PodPending] || state.isInstanceOf[PodRunning]) &&
+        pod.getMetadata.getDeletionTimestamp == null && !isPodInactive(pod) &&
+        !registeredExecutors.contains(id) && !deletedExecutorIds.contains(id) && scheduled.nonEmpty
+      if (eligible) {
+        val since = awaitingRegistration.getOrElseUpdate(id,
+          Option(scheduled.get.getLastTransitionTime)
+            .flatMap(t => Try(Instant.parse(t).toEpochMilli).toOption)
+            .getOrElse(clock.getTimeMillis()))
+        if (clock.getTimeMillis() - since >= registrationTimeout &&
+            schedulerBackend.excludeExecutorIfUnregistered(id.toString)) {
+          deletedExecutorIds += id
+          registrationTimedOutExecutorIds += id
+          awaitingRegistration -= id
+          executorPodsLifecycleManager.foreach(_.registerExecutorFailure(id))
+          logWarning(log"Executor ${MDC(LogKeys.EXECUTOR_ID, id)} did not register within " +
+            log"${MDC(LogKeys.TIMEOUT, registrationTimeout)} ms after scheduling. " +
+            log"Retiring pod ${MDC(LogKeys.POD_NAME, pod.getMetadata.getName)} on node " +
+            log"${MDC(LogKeys.HOST, pod.getSpec.getNodeName)}. Container statuses: " +
+            log"${MDC(LogKeys.REASON, registrationFailureDetails(pod))}")
+        }
+      } else if (!eligible) {
+        awaitingRegistration -= id
+      }
+    }
+
+    // A failed API call must not lose the cleanup request or count the failure again.
+    registrationTimedOutExecutorIds.toSeq.foreach { id =>
+      pods.get(id) match {
+        case Some(state) if !isPodInactive(state.pod) =>
+          val pod = state.pod
+          if (pod.getMetadata.getDeletionTimestamp == null) {
+            Utils.tryLogNonFatalError {
+              val resource = kubernetesClient.pods().inNamespace(namespace)
+                .withName(pod.getMetadata.getName)
+              if (shouldDeleteExecutors) {
+                resource.delete()
+              } else {
+                resource.patch(PatchContext.of(PatchType.STRATEGIC_MERGE), new PodBuilder()
+                  .editOrNewMetadata()
+                    .addToLabels(SPARK_EXECUTOR_INACTIVE_LABEL, "true")
+                    .endMetadata()
+                  .build())
+              }
+            }
+          }
+        case _ => registrationTimedOutExecutorIds -= id
+      }
+    }
+  }
 
   protected def onNewSnapshots(
       applicationId: String,
@@ -267,6 +364,8 @@ class ExecutorPodsAllocator(
     if (snapshots.nonEmpty) {
       lastSnapshot = snapshots.last
     }
+
+    expireUnregisteredExecutors(schedulerBackend)
 
     // Make a local, non-volatile copy of the reference since it's used multiple times. This
     // is the only method that modifies the list, so this is safe.
