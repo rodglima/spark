@@ -85,6 +85,13 @@ private[spark] class ExecutorPodsLifecycleManager(
     failureTracker.registerExecutorFailure()
   }
 
+  private[k8s] def registerExecutorFailure(executorId: Long): Unit = synchronized {
+    if (!failedExecutorIds.contains(executorId)) {
+      failedExecutorIds += executorId
+      failureTracker.registerExecutorFailure()
+    }
+  }
+
   def start(schedulerBackend: KubernetesClusterSchedulerBackend): Unit = {
     val eventProcessingInterval = conf.get(KUBERNETES_EXECUTOR_EVENT_PROCESSING_INTERVAL)
     snapshotsStore.addSubscriber(eventProcessingInterval) { executorPodsSnapshot =>
@@ -111,12 +118,13 @@ private[spark] class ExecutorPodsLifecycleManager(
         case _ => false
       }.keySet
 
-      val newFailedExecutorIds = currentFailedExecutorIds -- failedExecutorIds
-      if (newFailedExecutorIds.nonEmpty) {
-        logWarning(log"${MDC(LogKeys.COUNT, newFailedExecutorIds.size)} new failed executors.")
-        newFailedExecutorIds.foreach { _ => failureTracker.registerExecutorFailure() }
+      synchronized {
+        val newFailedExecutorIds = currentFailedExecutorIds -- failedExecutorIds
+        if (newFailedExecutorIds.nonEmpty) {
+          logWarning(log"${MDC(LogKeys.COUNT, newFailedExecutorIds.size)} new failed executors.")
+          newFailedExecutorIds.foreach(registerExecutorFailure)
+        }
       }
-      failedExecutorIds = failedExecutorIds ++ currentFailedExecutorIds
       snapshot.executorPods.foreach { case (execId, state) =>
         state match {
           case _state if isPodInactive(_state.pod) =>

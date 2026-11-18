@@ -78,6 +78,21 @@ class ExecutorPodsLifecycleManagerSuite extends SparkFunSuite with BeforeAndAfte
     eventHandlerUnderTest.start(schedulerBackend)
   }
 
+  test("SPARK-61890: count a registration timeout and subsequent pod failure only once") {
+    eventHandlerUnderTest.registerExecutorFailure(1L)
+    eventHandlerUnderTest.registerExecutorFailure(1L)
+    assert(eventHandlerUnderTest.getNumExecutorsFailed == 1)
+    val pod = failedExecutorWithoutDeletion(1)
+    val resource = mock(classOf[PodResource])
+    namedExecutorPods.put(pod.getMetadata.getName, resource)
+    when(resource.get()).thenReturn(pod)
+    snapshotsStore.updatePod(pod)
+    snapshotsStore.notifySubscribers()
+    assert(eventHandlerUnderTest.getNumExecutorsFailed == 1)
+    eventHandlerUnderTest.registerExecutorFailure(2L)
+    assert(eventHandlerUnderTest.getNumExecutorsFailed == 2)
+  }
+
   test("SPARK-41210: Window based executor failure tracking mechanism") {
     var _exitCode = -1
     var waitForExecutorPodsClock = new ManualClock(0L)
