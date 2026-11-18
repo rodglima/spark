@@ -179,6 +179,29 @@ class KubernetesClusterSchedulerBackendSuite extends SparkFunSuite with BeforeAn
     executorEndpoint
   }
 
+  test("SPARK-61890: reject late registration after its startup deadline") {
+    val endpoint = schedulerBackendUnderTest.createDriverEndpoint()
+    val timeoutContext = mock(classOf[RpcCallContext])
+    endpoint.receiveAndReply(timeoutContext).apply(
+      KubernetesClusterSchedulerBackend.ExcludeUnregisteredExecutor("1"))
+    verify(timeoutContext).reply(true)
+    val registerContext = mock(classOf[RpcCallContext])
+    endpoint.receiveAndReply(registerContext).apply(
+      RegisterExecutor("1", mock(classOf[RpcEndpointRef]), "host-1", 1,
+        Map.empty, Map.empty, Map.empty, defaultProfile.id))
+    verify(registerContext).sendFailure(any(classOf[IllegalStateException]))
+    assert(!schedulerBackendUnderTest.isExecutorActive("1"))
+  }
+
+  test("SPARK-61890: keep an executor registered before its startup deadline") {
+    registerExecutor(schedulerBackendUnderTest, "1")
+    val context = mock(classOf[RpcCallContext])
+    schedulerBackendUnderTest.createDriverEndpoint().receiveAndReply(context).apply(
+      KubernetesClusterSchedulerBackend.ExcludeUnregisteredExecutor("1"))
+    verify(context).reply(false)
+    assert(schedulerBackendUnderTest.isExecutorActive("1"))
+  }
+
   private def withDecommissionMetadata(
       f: KubernetesClusterSchedulerBackend => Unit): Unit = {
     val keys = Seq(KUBERNETES_ALLOCATION_PODS_ALLOCATOR.key,

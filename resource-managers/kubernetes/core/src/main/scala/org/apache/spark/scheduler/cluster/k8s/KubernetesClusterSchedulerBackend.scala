@@ -19,7 +19,7 @@ package org.apache.spark.scheduler.cluster.k8s
 import java.util.concurrent.{ScheduledExecutorService, TimeUnit}
 import java.util.concurrent.atomic.AtomicInteger
 
-import scala.collection.mutable.HashMap
+import scala.collection.mutable.{HashMap, HashSet}
 import scala.concurrent.Future
 
 import io.fabric8.kubernetes.api.model.Pod
@@ -354,8 +354,17 @@ private[spark] class KubernetesClusterSchedulerBackend(
     Some(new HadoopDelegationTokenManager(conf, sc.hadoopConfiguration, driverEndpoint))
   }
 
+  // Accessed only on the driver endpoint, together with executor registration. Keeping these
+  // IDs after pod deletion also rejects a registration delayed beyond the deletion event.
+  private val registrationFailedExecutorIds = new HashSet[String]
+
+  private[k8s] def excludeExecutorIfUnregistered(executorId: String): Boolean = {
+    driverEndpoint.askSync[Boolean](
+      KubernetesClusterSchedulerBackend.ExcludeUnregisteredExecutor(executorId))
+  }
+
   override protected def isExecutorExcluded(executorId: String, hostname: String): Boolean = {
-    podAllocator.isDeleted(executorId)
+    registrationFailedExecutorIds.contains(executorId) || podAllocator.isDeleted(executorId)
   }
 
   private class KubernetesDriverEndpoint extends DriverEndpoint {
@@ -389,8 +398,18 @@ private[spark] class KubernetesClusterSchedulerBackend(
       case _: RegisterExecutor if sc.isStopped => // No-op
     }
 
+    private def excludeUnregisteredExecutor(context: RpcCallContext): PartialFunction[Any, Unit] = {
+      case KubernetesClusterSchedulerBackend.ExcludeUnregisteredExecutor(executorId) =>
+        // This decision is serialized with RegisterExecutor on this endpoint.
+        val unregistered = !getExecutorIds().contains(executorId)
+        if (unregistered) {
+          registrationFailedExecutorIds += executorId
+        }
+        context.reply(unregistered)
+    }
+
     override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] =
-      generateExecID(context).orElse(
+      excludeUnregisteredExecutor(context).orElse(generateExecID(context)).orElse(
         ignoreRegisterExecutorAtStoppedContext.orElse(
           super.receiveAndReply(context)))
 
@@ -423,4 +442,8 @@ private[spark] class KubernetesClusterSchedulerBackend(
     }
   }
 
+}
+
+private[spark] object KubernetesClusterSchedulerBackend {
+  private[k8s] case class ExcludeUnregisteredExecutor(executorId: String)
 }
