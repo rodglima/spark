@@ -2051,6 +2051,35 @@ See the [configuration page](configuration.html) for information on Spark config
   <td>3.1.0</td>
 </tr>
 <tr>
+  <td><code>spark.kubernetes.executor.registrationTimeout.enabled</code></td>
+  <td><code>true</code></td>
+  <td>
+    Enables registration timeout recovery in the <code>direct</code> allocator. When disabled,
+    scheduled executor pods that never register are kept without registration timeout failures
+    or replacement requests. The existing timeout for pod creation requests remains active.
+    The registration timeout is ignored while this flag is disabled.
+  </td>
+  <td>4.5.0</td>
+</tr>
+<tr>
+  <td><code>spark.kubernetes.executor.registrationTimeout</code></td>
+  <td><code>600s</code></td>
+  <td>
+    With the <code>direct</code> allocator, time allowed for an executor to register with the
+    driver after its pod reports <code>PodScheduled=True</code>. This includes image loading,
+    volume setup, init containers, and JVM startup. Unscheduled pods waiting for cluster
+    capacity are kept. Timed out executors are excluded from registration and replaced without
+    changing the target executor count. Only applies when
+    <code>spark.kubernetes.executor.registrationTimeout.enabled</code> is true.
+    The timeout must be positive. To disable recovery, set
+    <code>spark.kubernetes.executor.registrationTimeout.enabled</code> to false.
+    Each timed out executor counts once toward <code>spark.executor.maxNumFailures</code>,
+    across all resource profiles, and follows <code>spark.executor.failuresValidityInterval</code>.
+    Pod cleanup honors <code>spark.kubernetes.executor.deleteOnTermination</code>.
+  </td>
+  <td>4.5.0</td>
+</tr>
+<tr>
   <td><code>spark.kubernetes.allocation.driver.readinessTimeout</code></td>
   <td><code>1s</code></td>
   <td>
